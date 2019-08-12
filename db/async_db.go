@@ -43,7 +43,7 @@ func NewAsyncDB(name string, dir string, dbBackendType DBBackendType) (*AsyncDB,
 		db:                NewDB(name, dbBackendType, dir),
 		toWrite:           make(map[string][]byte),
 		inWrite:           make(map[string][]byte),
-		flushLimit:        10000,
+		flushLimit:        1,
 		writeTrigChan:     make(chan bool),
 		itrCtr:            0,
 		itrCtrReleaseChan: make(chan bool)}
@@ -64,8 +64,7 @@ func (db *AsyncDB) _TryFlush() {
 	}
 }
 
-func (db *AsyncDB) _WriteRoutine(sync bool) {
-	db.flushMtx.Lock()
+func (db *AsyncDB) _WriteRoutineNoLock(sync bool) {
 	db.itrCtrMtx.Lock()
 	for db.itrCtr > 0 {
 		db.itrCtrMtx.Unlock()
@@ -73,7 +72,6 @@ func (db *AsyncDB) _WriteRoutine(sync bool) {
 		db.itrCtrMtx.Lock()
 	}
 	defer db.itrCtrMtx.Unlock()
-	defer db.flushMtx.Unlock()
 
 	if len(db.inWrite) > 0 {
 		panic(fmt.Sprintf("Invariant violated: len(AsyncDB.inWrite) should be 0, but is actually %d", len(db.inWrite)))
@@ -115,6 +113,12 @@ func (db *AsyncDB) _WriteRoutine(sync bool) {
 	db.baseMtx.Lock()
 	db.inWrite = make(map[string][]byte)
 	db.baseMtx.Unlock()
+}
+
+func (db *AsyncDB) _WriteRoutine(sync bool) {
+	db.flushMtx.Lock()
+	db._WriteRoutineNoLock(sync)
+	db.flushMtx.Unlock()
 }
 
 func (db *AsyncDB) WriteRoutine() {
@@ -170,15 +174,18 @@ func (db *AsyncDB) Has(key []byte) bool {
 }
 
 func (db *AsyncDB) Set(key, val []byte) {
+	db.mtx.Lock()
+	db.SetNoLockFlush(key, val)
+	db.mtx.Unlock()
+	db._TryFlush()
+}
+
+func (db *AsyncDB) SetNoLockFlush(key, val[]byte) {
 	key = nonNilBytes(key)
 	val = nonNilBytes(val)
 	k := string(key)
 
-	db.mtx.Lock()
 	db.toWrite[k] = val
-	db.mtx.Unlock()
-
-	db._TryFlush()
 }
 
 // First, trigger a set
@@ -193,14 +200,17 @@ func (db *AsyncDB) SetSync(key, val []byte) {
 }
 
 func (db *AsyncDB) Delete(key []byte) {
+	db.mtx.Lock()
+	db.DeleteNoLockFlush(key)
+	db.mtx.Unlock()
+	db._TryFlush()
+}
+
+func (db *AsyncDB) DeleteNoLockFlush(key []byte) {
 	key = nonNilBytes(key)
 	k := string(key)
 
-	db.mtx.Lock()
 	db.toWrite[k] = nil
-	db.mtx.Unlock()
-
-	db._TryFlush()
 }
 
 func (db *AsyncDB) DeleteSync(key []byte) {
@@ -332,4 +342,57 @@ func (itr *asyncDBIterator) assertIsValid() {
 	if !itr.Valid() {
 		panic("cacheDBIterator is invalid")
 	}
+}
+
+type asyncDBBatch struct {
+	db  AsyncDB
+	ops []operation
+}
+
+type asyncOp struct {
+	opType
+	key   []byte
+	value []byte
+}
+
+func (aBatch *asyncDBBatch) Set(key, value []byte) {
+	aBatch.ops = append(aBatch.ops, operation{opTypeSet, key, value})
+}
+
+func (aBatch *asyncDBBatch) Delete(key []byte) {
+	aBatch.ops = append(aBatch.ops, operation{opTypeDelete, key, nil})
+}
+
+func (aBatch *asyncDBBatch) Write() {
+	aBatch.db.flushMtx.Lock()
+	defer aBatch.db.flushMtx.Unlock()
+
+	for _, op := range aBatch.ops {
+		switch op.opType {
+		case opTypeSet:
+			aBatch.db.SetNoLockFlush(op.key, op.value)
+		case opTypeDelete:
+			aBatch.db.DeleteNoLockFlush(op.key)
+		}
+	}
+	aBatch.db._WriteRoutineNoLock(false)
+}
+
+func (aBatch *asyncDBBatch) WriteSync() {
+	aBatch.db.flushMtx.Lock()
+	defer aBatch.db.flushMtx.Unlock()
+
+	for _, op := range aBatch.ops {
+		switch op.opType {
+		case opTypeSet:
+			aBatch.db.SetNoLockFlush(op.key, op.value)
+		case opTypeDelete:
+			aBatch.db.DeleteNoLockFlush(op.key)
+		}
+	}
+	aBatch.db._WriteRoutineNoLock(true)
+}
+
+func (aBatch *asyncDBBatch) Close() {
+	aBatch.ops = nil
 }
